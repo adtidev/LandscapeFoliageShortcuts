@@ -1,0 +1,21 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Landscape & Foliage Shortcuts",
+	"Description": "Custom shortcuts for landscape and foliage editing: Q/E mode switching, 1-9 tool/layer selection, G+Scroll brush size, V+Scroll strength/density, foliage presets",
+	"Category": "Editor",
+	"CreatedBy": "Adam",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "LandscapeFoliageShortcuts",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}
