@@ -25,7 +25,8 @@ public class LandscapeFoliageShortcuts : ModuleRules
 			"Foliage",
 			"Landscape",
 			"EditorFramework",
-			"LevelEditor"
+			"LevelEditor",
+			"PropertyEditor"
 		});
 
 		// Include private headers for editor mode access

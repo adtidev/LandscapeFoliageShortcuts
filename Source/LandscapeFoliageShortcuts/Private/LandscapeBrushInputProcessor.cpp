@@ -33,6 +33,7 @@
 #include "SLevelViewport.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
+#include "PropertyEditorModule.h"       // For NotifyCustomizationModuleChanged (detail panel refresh)
 
 class FLandscapeBrushInputProcessor : public IInputProcessor
 {
@@ -564,8 +565,10 @@ private:
 		}
 	}
 
-	// Switch to tool at KeyIndex (0-8) by directly setting internal pointers
+	// Switch to tool at KeyIndex (0-8) with proper lifecycle and UI refresh
 	// Uses hardcoded tool names to match UI order (ValidTools array order doesn't match UI)
+	// Note: FEdModeLandscape::SetCurrentTool is not exported, so we replicate its key behavior:
+	// ExitTool/EnterTool (virtual, callable via vtable), pointer updates, and detail panel refresh
 	void SwitchLandscapeToolDirect(int32 TargetKeyIndex)
 	{
 		FEdMode* Mode = GLevelEditorModeTools().GetActiveMode(FBuiltinEditorModes::EM_Landscape);
@@ -580,8 +583,18 @@ private:
 			return;
 		}
 
-		// Get target tool name from hardcoded UI-order list (not ValidTools which has different order)
-		FName TargetToolName = GetSculptToolName(TargetKeyIndex);
+		// Get target tool name from hardcoded UI-order list based on current mode
+		FName ModeName = LandscapeMode->CurrentToolMode->ToolModeName;
+		FName TargetToolName = NAME_None;
+		if (ModeName == TEXT("ToolMode_Sculpt"))
+		{
+			TargetToolName = GetSculptToolName(TargetKeyIndex);
+		}
+		else if (ModeName == TEXT("ToolMode_Manage"))
+		{
+			TargetToolName = GetManageToolName(TargetKeyIndex);
+		}
+
 		if (TargetToolName == NAME_None)
 		{
 			return;
@@ -615,13 +628,28 @@ private:
 			return; // Tool not found or already selected
 		}
 
-		// Update pointers directly
+		// Exit old tool (virtual call - dispatches through vtable to LandscapeEditor DLL)
+		LandscapeMode->CurrentTool->PreviousBrushIndex = LandscapeMode->CurrentBrushSetIndex;
+		LandscapeMode->CurrentTool->ExitTool();
+
+		// Update pointers
 		LandscapeMode->CurrentToolIndex = NewToolIndex;
 		LandscapeMode->CurrentTool = LandscapeMode->LandscapeTools[NewToolIndex].Get();
 		LandscapeMode->CurrentToolMode->CurrentToolName = TargetToolName;
 
+		// Enter new tool (virtual calls)
+		LandscapeMode->CurrentTool->EnterTool();
+		LandscapeMode->CurrentTool->SetEditRenderType();
+
 		// Update brush visibility - hide for Ramp tool, show for others
 		UpdateBrushVisibilityForTool(TargetToolName == TEXT("Ramp"));
+
+		// Force all detail panels to refresh - this causes the landscape properties panel
+		// to re-evaluate property visibility based on the new CurrentTool
+		FPropertyEditorModule& PropertyEditorModule = FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
+		PropertyEditorModule.NotifyCustomizationModuleChanged();
+
+		GEditor->RedrawLevelEditingViewports();
 	}
 
 	// Get tool name for current mode by key index
@@ -686,31 +714,14 @@ private:
 			return;
 		}
 
-		// Find the actual tool index in LandscapeTools array
-		int32 NewToolIndex = INDEX_NONE;
-		FString TargetToolString = TargetToolName.ToString();
-		for (int32 i = 0; i < LandscapeMode->LandscapeTools.Num(); i++)
-		{
-			if (LandscapeMode->LandscapeTools[i].IsValid())
-			{
-				FString ToolName = LandscapeMode->LandscapeTools[i]->GetToolName();
-				if (TargetToolString == ToolName)
-				{
-					NewToolIndex = i;
-					break;
-				}
-			}
-		}
-
-		if (NewToolIndex == INDEX_NONE || NewToolIndex == LandscapeMode->CurrentToolIndex)
+		// Skip if already on this tool
+		if (LandscapeMode->CurrentTool->GetToolName() == TargetToolName.ToString())
 		{
 			return;
 		}
 
-		// Update pointers
-		LandscapeMode->CurrentToolIndex = NewToolIndex;
-		LandscapeMode->CurrentTool = LandscapeMode->LandscapeTools[NewToolIndex].Get();
-		LandscapeMode->CurrentToolMode->CurrentToolName = TargetToolName;
+		// Use the landscape mode's proper SetCurrentTool API
+		LandscapeMode->SetCurrentTool(TargetToolName);
 	}
 
 	void SwitchLandscapeToolByIndex(int32 KeyIndex)
