@@ -9,8 +9,6 @@ Unreal Engine 5 editor plugin that adds keyboard shortcuts for landscape sculpti
 - **Scroll-wheel brush size** — Hold G and scroll to resize the brush in both Landscape and Foliage modes. Multiplicative scaling so it feels natural at any size.
 - **Scroll-wheel strength/density** — Hold V and scroll to adjust tool strength (Landscape) or paint density (Foliage) in 10% increments.
 - **Foliage presets** — Save/load foliage type selections with Ctrl+1-9 / 1-9. Presets persist in `Config/FoliagePresets.ini` so they survive editor restarts. Presets match by source mesh path so they work across levels.
-- **Ramp tool awareness** — Automatically hides the brush circle when the Ramp tool is active (it has its own gizmo) and restores it when you switch away.
-- **Viewport-safe** — Number keys only fire when the viewport is focused, so typing in text fields or property panels won't trigger tool switches.
 
 ## Installation
 
