@@ -1,8 +1,8 @@
 // LandscapeBrushInputProcessor.cpp
 // Editor-only input processor for Landscape/Foliage mode shortcuts:
 // Landscape mode:
-//   - Q: Switch to Sculpt mode
-//   - E: Switch to Paint mode
+//   - Q: Switch to Sculpt mode (Rotate gizmo in Splines tool only if bSplineGizmoKeys=True)
+//   - E: Switch to Paint mode (Translate gizmo in Splines tool only if bSplineGizmoKeys=True)
 //   - G+Scroll: Brush size adjustment
 //   - V+Scroll: Tool strength adjustment (10% increments)
 //   - 1-9: Sculpt mode: tool switching; Paint mode: layer selection (grass, dirt, etc.)
@@ -16,6 +16,7 @@
 #include "CoreMinimal.h"
 #include "Framework/Application/IInputProcessor.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Editor.h"                    // For GEditor->IsTransactionActive/EndTransaction
 #include "EditorModeManager.h"
 #include "EditorModes.h"
 #include "EdMode.h"                    // For FEdMode::GetToolkit()
@@ -34,12 +35,42 @@
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
 #include "PropertyEditorModule.h"       // For NotifyCustomizationModuleChanged (detail panel refresh)
+#include "UnrealWidget.h"               // For UE::Widget::EWidgetMode (spline gizmo control)
 
 class FLandscapeBrushInputProcessor : public IInputProcessor
 {
 public:
 	static TSharedPtr<FLandscapeBrushInputProcessor> Instance;
 	static float SharedBrushSize;
+	static FDelegateHandle ModeIDChangedHandle;
+
+	// UNREAL-36 fix: A landscape brush stroke (e.g. "Landscape Editing: Smooth") can leave a
+	// transaction dangling when the editor mode is switched (Landscape → Foliage, or Foliage →
+	// Landscape) mid-stroke — e.g. via UE's built-in Shift+2 shortcut or via this plugin's own
+	// tool/palette shortcuts. FoliageEdMode.cpp:521 then ensures on exit with "Transaction Active
+	// when exiting foliage edit mode: 'Landscape Editing: Smooth'". Close any active transaction
+	// before it can outlive the mode/tool it belongs to.
+	static void EndAnyOpenTransaction()
+	{
+		if (GEditor)
+		{
+			int32 Guard = 0;
+			while (GEditor->IsTransactionActive() && Guard++ < 8)
+			{
+				GEditor->EndTransaction();
+			}
+		}
+	}
+
+	static void HandleEditorModeIDChanged(const FEditorModeID& ModeID, bool bIsEntering)
+	{
+		if (GEditor && GEditor->IsTransactionActive())
+		{
+			UE_LOG(LogTemp, Log, TEXT("[LandscapeShortcuts] Ending stray transaction on mode %s (enter=%d)"),
+				*ModeID.ToString(), bIsEntering ? 1 : 0);
+			EndAnyOpenTransaction();
+		}
+	}
 
 	static void Register()
 	{
@@ -48,6 +79,9 @@ public:
 			Instance = MakeShared<FLandscapeBrushInputProcessor>();
 			FSlateApplication::Get().RegisterInputPreProcessor(Instance);
 			SharedBrushSize = 2048.0f;
+
+			ModeIDChangedHandle = GLevelEditorModeTools().OnEditorModeIDChanged().AddStatic(
+				&FLandscapeBrushInputProcessor::HandleEditorModeIDChanged);
 		}
 	}
 
@@ -55,6 +89,11 @@ public:
 	{
 		if (Instance.IsValid() && FSlateApplication::IsInitialized())
 		{
+			if (ModeIDChangedHandle.IsValid())
+			{
+				GLevelEditorModeTools().OnEditorModeIDChanged().Remove(ModeIDChangedHandle);
+				ModeIDChangedHandle.Reset();
+			}
 			FSlateApplication::Get().UnregisterInputPreProcessor(Instance);
 			Instance.Reset();
 		}
@@ -113,6 +152,20 @@ public:
 		return false;
 	}
 
+	// True if keyboard focus is currently in an editable text box (so number keys are real typing,
+	// not shortcuts). Used to gate foliage shortcuts, which must also work while the Foliage palette
+	// panel has focus (selecting foliage types focuses the palette, not the viewport).
+	bool IsTypingInTextField() const
+	{
+		TSharedPtr<SWidget> FocusedWidget = FSlateApplication::Get().GetKeyboardFocusedWidget();
+		if (!FocusedWidget.IsValid())
+		{
+			return false;
+		}
+		const FString WidgetType = FocusedWidget->GetType().ToString();
+		return WidgetType.Contains(TEXT("EditableText")) || WidgetType.Contains(TEXT("SpinBox"));
+	}
+
 	virtual bool HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent) override
 	{
 		if (InKeyEvent.GetKey() == EKeys::G)
@@ -123,25 +176,83 @@ public:
 		{
 			bVKeyDown = true;
 		}
+		// Track Ctrl ourselves — the FKeyEvent/Slate modifier flags have proven unreliable
+		// inside this preprocessor for Ctrl+number, so we maintain our own held-state.
+		if (InKeyEvent.GetKey() == EKeys::LeftControl || InKeyEvent.GetKey() == EKeys::RightControl)
+		{
+			bCtrlKeyDown = true;
+		}
 
 		// Number key shortcuts only fire when viewport is focused (not typing in settings fields)
 		const bool bViewportHasFocus = IsViewportFocused();
 
+		// Broad diagnostic: log EVERY keydown while foliage mode is active so we can see whether
+		// the Ctrl+number event reaches this preprocessor at all (vs being eaten as an accelerator).
+		if (GLevelEditorModeTools().IsModeActive(FBuiltinEditorModes::EM_Foliage))
+		{
+			const FModifierKeysState DiagMods = FSlateApplication::Get().GetModifierKeys();
+			UE_LOG(LogTemp, Log, TEXT("[BugDiag_FoliageKey] key=%s vpFocus=%d ctrl(evt=%d slate=%d tracked=%d)"),
+				*InKeyEvent.GetKey().ToString(), bViewportHasFocus ? 1 : 0,
+				InKeyEvent.IsControlDown() ? 1 : 0, DiagMods.IsControlDown() ? 1 : 0, bCtrlKeyDown ? 1 : 0);
+		}
+
 		// Landscape mode shortcuts
 		if (bViewportHasFocus && GLevelEditorModeTools().IsModeActive(FBuiltinEditorModes::EM_Landscape) && !InKeyEvent.IsControlDown() && !InKeyEvent.IsShiftDown())
 		{
-			// Q/E: Toggle between Sculpt and Paint modes
+			// Q/E swap the Sculpt/Paint palettes by default, in every tool including Splines.
+			// Opt in per-user to have Q/E drive the spline transform gizmo instead by adding to
+			// Saved/Config/WindowsEditor/EditorPerProjectUserSettings.ini (never submitted):
+			//   [LandscapeFoliageShortcuts]
+			//   bSplineGizmoKeys=True
+			// Kept as a per-user toggle rather than a hard-coded choice because a shared plugin
+			// binary is rebuilt and submitted by whoever ships last — a source-level local edit
+			// gets clobbered on every sync (jool CL 1118 / 1191).
+			static bool bSplineGizmoKeys = false;
+			static bool bSplineGizmoKeysRead = false;
+			if (!bSplineGizmoKeysRead)
+			{
+				bSplineGizmoKeysRead = true;
+				GConfig->GetBool(TEXT("LandscapeFoliageShortcuts"), TEXT("bSplineGizmoKeys"), bSplineGizmoKeys, GEditorPerProjectIni);
+				UE_LOG(LogTemp, Log, TEXT("[LandscapeShortcuts] bSplineGizmoKeys=%d (Q/E = %s)"),
+					bSplineGizmoKeys ? 1 : 0, bSplineGizmoKeys ? TEXT("spline gizmo in Splines tool") : TEXT("Sculpt/Paint swap always"));
+			}
+
+			bool bInSplinesMode = false;
+			if (bSplineGizmoKeys)
+			{
+				FEdMode* LandscapeEdMode = GLevelEditorModeTools().GetActiveMode(FBuiltinEditorModes::EM_Landscape);
+				if (LandscapeEdMode)
+				{
+					FEdModeLandscape* LM = static_cast<FEdModeLandscape*>(LandscapeEdMode);
+					if (LM->CurrentTool)
+					{
+						bInSplinesMode = (FString(LM->CurrentTool->GetToolName()) == TEXT("Splines"));
+					}
+				}
+			}
+
+			// Q: Rotate gizmo (Splines) or switch to Sculpt mode (other tools)
 			if (InKeyEvent.GetKey() == EKeys::Q)
 			{
+				if (bInSplinesMode)
+				{
+					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Rotate);
+					return true;
+				}
 				SwitchLandscapeModePalette(TEXT("ToolMode_Sculpt"));
-				// Sculpt mode defaults to Sculpt tool (not Ramp), so restore brush
 				UpdateBrushVisibilityForTool(false);
 				return true;
 			}
+
+			// E: Translate gizmo (Splines) or switch to Paint mode (other tools)
 			if (InKeyEvent.GetKey() == EKeys::E)
 			{
+				if (bInSplinesMode)
+				{
+					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Translate);
+					return true;
+				}
 				SwitchLandscapeModePalette(TEXT("ToolMode_Paint"));
-				// Paint mode doesn't have Ramp tool, so restore brush
 				UpdateBrushVisibilityForTool(false);
 				return true;
 			}
@@ -173,19 +284,35 @@ public:
 			}
 		}
 
-		// Foliage mode preset system
-		if (bViewportHasFocus && GLevelEditorModeTools().IsModeActive(FBuiltinEditorModes::EM_Foliage))
+		// Foliage mode preset system.
+		// NOTE: gated on "not typing in a text field" rather than viewport focus — selecting foliage
+		// types focuses the Foliage palette panel (vpFocus=0), so a viewport-focus gate blocked
+		// Ctrl+number saves entirely. Text-field/spinbox check keeps number keys out of brush/density
+		// entry fields.
+		if (!IsTypingInTextField() && GLevelEditorModeTools().IsModeActive(FBuiltinEditorModes::EM_Foliage))
 		{
 			int32 PresetIndex = GetKeyIndex(InKeyEvent.GetKey());
 			if (PresetIndex != INDEX_NONE)
 			{
-				if (InKeyEvent.IsControlDown())
+				// Read modifier state from the live Slate modifier-key state rather than the
+				// FKeyEvent's cached flags. In an IInputProcessor the event's IsControlDown() can
+				// come back false even while Ctrl is physically held, which made Ctrl+N (save) fall
+				// through to the plain-N (load) branch — wiping the selection instead of saving it.
+				const FModifierKeysState Mods = FSlateApplication::Get().GetModifierKeys();
+				const bool bCtrl  = Mods.IsControlDown()  || InKeyEvent.IsControlDown() || bCtrlKeyDown;
+				const bool bAlt   = Mods.IsAltDown()      || InKeyEvent.IsAltDown();
+				const bool bShift = Mods.IsShiftDown()    || InKeyEvent.IsShiftDown();
+
+				UE_LOG(LogTemp, Log, TEXT("[BugDiag_FoliageHotkey] key=%d ctrl(evt=%d slate=%d tracked=%d) alt=%d shift=%d"),
+					PresetIndex, InKeyEvent.IsControlDown() ? 1 : 0, Mods.IsControlDown() ? 1 : 0, bCtrlKeyDown ? 1 : 0, bAlt ? 1 : 0, bShift ? 1 : 0);
+
+				if (bCtrl)
 				{
 					// Ctrl+1-9: Save preset
 					SaveFoliagePreset(PresetIndex);
 					return true;
 				}
-				else if (InKeyEvent.IsAltDown())
+				else if (bAlt)
 				{
 					// Alt+1: Deselect all (only Alt+1, not Alt+2-9)
 					if (PresetIndex == 0)
@@ -194,7 +321,7 @@ public:
 					}
 					return true;
 				}
-				else if (!InKeyEvent.IsShiftDown())
+				else if (!bShift)
 				{
 					// 1-9: Load preset (but not Shift+1-9, those switch editor modes)
 					LoadFoliagePreset(PresetIndex);
@@ -215,6 +342,10 @@ public:
 		if (InKeyEvent.GetKey() == EKeys::V)
 		{
 			bVKeyDown = false;
+		}
+		if (InKeyEvent.GetKey() == EKeys::LeftControl || InKeyEvent.GetKey() == EKeys::RightControl)
+		{
+			bCtrlKeyDown = false;
 		}
 		return false; // Don't consume
 	}
@@ -317,6 +448,7 @@ public:
 private:
 	bool bGKeyDown = false;
 	bool bVKeyDown = false;
+	bool bCtrlKeyDown = false;
 	bool bIsRampToolActive = false;
 	bool bWasLandscapeModeActive = false;
 
@@ -583,6 +715,10 @@ private:
 			return;
 		}
 
+		// UNREAL-36: ExitTool/EnterTool below can be called while a brush-stroke transaction
+		// is still open; end it here so it can't outlive the tool that owns it.
+		EndAnyOpenTransaction();
+
 		// Get target tool name from hardcoded UI-order list based on current mode
 		FName ModeName = LandscapeMode->CurrentToolMode->ToolModeName;
 		FName TargetToolName = NAME_None;
@@ -690,6 +826,10 @@ private:
 		{
 			return;
 		}
+
+		// UNREAL-36: SetCurrentPalette can tear down / re-enter tools; end any in-flight
+		// brush-stroke transaction first so it can't survive the palette change.
+		EndAnyOpenTransaction();
 
 		// Switch palette - this calls OnToolPaletteChanged which calls OnChangeMode
 		Toolkit->SetCurrentPalette(PaletteName);
@@ -865,6 +1005,7 @@ private:
 
 TSharedPtr<FLandscapeBrushInputProcessor> FLandscapeBrushInputProcessor::Instance;
 float FLandscapeBrushInputProcessor::SharedBrushSize = 2048.0f;
+FDelegateHandle FLandscapeBrushInputProcessor::ModeIDChangedHandle;
 
 // Namespace for module registration
 namespace LandscapeBrush
